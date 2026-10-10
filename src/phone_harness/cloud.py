@@ -1,9 +1,12 @@
-"""Phone Harness Cloud: rent an Android phone, then drive it like any other.
+"""Phone Harness Cloud: rent a phone, then drive it like any other.
 
 This module decides which phone exists and who pays for it. It never drives
-one: a cloud phone is an Android device at host:port, so once `cloud start`
-has run `adb connect` and `unlock`, android.py and every helper work on it
-unchanged. The ADB endpoint and unlock code stay in here; nobody copies them.
+one. `cloud start` picks an entry from the account catalog (`GET /me` →
+`available`) and the service returns a session. The session carries one link:
+an Android phone is adb at host:port (`adb connect` and `unlock` live here),
+and a phone with no shell carries a control URL that remote.py drives over
+HTTPS. Which link it is, not the platform name, is what the rest of the CLI
+branches on.
 
   auth.json    (config dir, 0600)  this machine's sign-in: OAuth tokens from
                                    `cloud login`, refreshed here as they expire
@@ -36,10 +39,11 @@ USER_AGENT = "phone-harness-cli"
 
 
 class CloudError(RuntimeError):
-    def __init__(self, status, body):
+    def __init__(self, status, body, headers=None):
         self.status = status
         self.body = body if isinstance(body, dict) else {}
         self.code = self.body.get("code")
+        self.headers = headers
         super().__init__(self.body.get("error") or f"HTTP {status}")
 
 
@@ -176,10 +180,6 @@ def _api(method, path, body=None, token=None, headers=None, timeout=40):
 def _request(method, path, body, token, headers, timeout):
     h = {"Authorization": f"Bearer {token}", "Accept": "application/json",
          "User-Agent": USER_AGENT, **(headers or {})}
-    # A gate in front of a private instance (exe.dev's, for the dev VM) admits this bearer.
-    proxy = os.environ.get("PHONE_HARNESS_CLOUD_PROXY_TOKEN")
-    if proxy:
-        h["X-Exedev-Authorization"] = f"Bearer {proxy}"
     data = None
     if body is not None:
         h["Content-Type"] = "application/json"
@@ -195,7 +195,7 @@ def _request(method, path, body, token, headers, timeout):
             parsed = json.loads(raw)
         except ValueError:
             parsed = {"error": raw.decode(errors="replace")[:200]}
-        raise CloudError(e.code, parsed) from None
+        raise CloudError(e.code, parsed, e.headers) from None
     return json.loads(raw) if raw.strip() else {}
 
 
@@ -203,29 +203,115 @@ def _explain(e):
     """A CloudError, as the next thing the user should do."""
     if e.status == 401:
         return "This machine is signed out. Run: phone-harness cloud login"
-    if e.status == 403:
-        return (f"Your account isn't enabled for phones yet ({e}). "
-                f"{_waitlist_line()}")
-    if e.status == 402 or "balance_cents" in e.body:
+    if e.status == 403 and e.code == "account_blocked":
+        return f"Rentals are blocked on this account ({e})."
+    if e.status in (402, 403) and (
+            e.code in ("insufficient_balance", "balance") or "balance_cents" in e.body
+            or "credit" in str(e).lower() or "balance" in str(e).lower()):
         cents = e.body.get("balance_cents")
         have = f" (${cents / 100:.2f})" if isinstance(cents, int) else ""
         return f"Not enough credit{have}. Add credit at {_dashboard()}"
+    if e.status == 403:
+        # beta_access_required keeps the waitlist line the older CLI printed.
+        return (f"Your account isn't enabled for phones yet ({e}). "
+                f"{_waitlist_line()}")
     if "available_session_slots" in e.body:
         return (f"Session limit reached ({e.body.get('active_session_count')} of "
                 f"{e.body.get('session_limit')}). `phone-harness cloud ls` shows them.")
+    if e.code == "session_limit":
+        count, limit = e.body.get("active_session_count"), e.body.get("session_limit")
+        extra = f" ({count} of {limit})" if count is not None and limit is not None else ""
+        return f"Session limit reached{extra}. `phone-harness cloud ls` shows them."
+    if e.code == "phones_busy":
+        retry = _retry_after(e)
+        when = f" Try again in {retry}s." if retry else " Try again shortly."
+        return f"Every phone is busy right now.{when}"
+    if e.code == "device_unavailable":
+        return ("That phone is granted to this account but not on its host right now. "
+                "Try again once it is connected.")
     return f"{e} (HTTP {e.status})"
+
+
+def _retry_after(e):
+    raw = e.headers.get("Retry-After") if getattr(e, "headers", None) else None
+    if raw is None:
+        raw = e.body.get("retry_after_seconds")
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
 
 
 # --- the attached session ----------------------------------------------------
 
-def attached():
-    """The session the helpers should drive, or None. Read by transport.py and
-    android.py on every run, so: no network, and never raises."""
-    try:
-        sess = _load_state().get("session")
-    except Exception:
+# A saved session reaches its phone through exactly one link:
+#   {"kind": "adb", "host", "port", "code"}   an Android: adb connect + unlock
+#   {"kind": "control", "url", "token"}       no shell (a real iPhone): ops over HTTPS
+LINK_KINDS = ("adb", "control")
+
+
+def _as_linked(sess):
+    """A session record the helpers can drive, or None.
+
+    Current files store `link`. A file written by the Android-only CLI stores
+    host/port/code on the session itself; that is an adb link, so an upgrade
+    mid-session keeps driving the phone that is already running.
+    """
+    if not isinstance(sess, dict):
         return None
-    if not isinstance(sess, dict) or not sess.get("host") or not sess.get("code"):
+    link = sess.get("link")
+    if isinstance(link, dict) and link.get("kind") in LINK_KINDS:
+        return sess
+    if sess.get("host") and sess.get("code"):
+        return {**sess, "link": {"kind": "adb", "host": sess["host"],
+                                 "port": sess.get("port"), "code": sess["code"]}}
+    return None
+
+
+def _known_sessions(state):
+    """sid -> record, including the single attached session older files store."""
+    sessions = dict(state.get("sessions") or {})
+    current = state.get("session")
+    if isinstance(current, dict) and current.get("sid") and current["sid"] not in sessions:
+        sessions[current["sid"]] = current
+    return sessions
+
+
+def _find_recorded(state, pin):
+    sessions = _known_sessions(state)
+    if pin in sessions:
+        return sessions[pin]
+    hits = [s for sid, s in sessions.items() if sid.startswith(pin)]
+    return hits[0] if len(hits) == 1 else None
+
+
+def attached(kind=None):
+    """The session the helpers should drive, or None; with `kind`, only a
+    session reached that way.
+
+    `PHONE_HARNESS_SESSION` (or `--session`, which sets it) pins one session
+    for this process, so parallel agents do not share the state file's
+    fallback. With neither, the fallback is the attached session a person at
+    a terminal last started or `cloud use`d. The unpinned read does no
+    network and never raises. A pin that is not on disk is fetched once."""
+    try:
+        state = _load_state()
+    except Exception:
+        state = {}
+    pin = os.environ.get("PHONE_HARNESS_SESSION")
+    if pin:
+        raw = _find_recorded(state, pin)
+        sess = _as_linked(raw)
+        if sess is None:
+            sess = _pull_pinned(pin)
+    else:
+        try:
+            sess = _as_linked(state.get("session"))
+        except Exception:
+            return None
+    if sess is None:
+        return None
+    if kind not in (None, sess["link"]["kind"]):
         return None
     if sess.get("expires_at") and time.time() >= sess["expires_at"]:
         return None
@@ -233,7 +319,54 @@ def attached():
 
 
 def serial_of(sess):
-    return f"{sess['host']}:{sess['port']}"
+    """The adb serial of an adb-linked session."""
+    return f"{sess['link']['host']}:{sess['link']['port']}"
+
+
+def _describe_link(sess):
+    if sess["link"]["kind"] == "control":
+        return "no shell on this phone; the helpers drive it over HTTPS"
+    return serial_of(sess)
+
+
+def _link_kind(session):
+    """adb or control, from a saved record or from the API session. None when
+    the session has not said yet (still provisioning, no block)."""
+    if not isinstance(session, dict):
+        return None
+    link = session.get("link")
+    if isinstance(link, dict) and link.get("kind") in LINK_KINDS:
+        return link["kind"]
+    if (session.get("control") or {}).get("url"):
+        return "control"
+    if (session.get("adb") or {}).get("host") or session.get("host"):
+        return "adb"
+    return None
+
+
+def _keeps_state(session):
+    """Whether stopping saves the phone. A control link keeps its data on the
+    phone, even when the session also names a profile. An adb link with a
+    profile is written to storage after the session ends."""
+    if _link_kind(session) == "control":
+        return False
+    return bool(session.get("profile"))
+
+
+def _kind_of_phone(session, label=None):
+    """Wording for a session, from its link. A control link is an iPhone."""
+    if _link_kind(session) == "control":
+        label = label or session.get("label")
+        return f"your iPhone, {label}" if label else "your iPhone"
+    return "your phone" if session.get("profile") else "temporary"
+
+
+def _adb_present():
+    from .android import _adb_bin
+    if not shutil.which(_adb_bin()):
+        sys.exit("adb is not installed, and it is how the helpers reach the phone. Install "
+                 "Android platform-tools first (macOS: brew install android-platform-tools; "
+                 "`phone-harness --doctor android` names it for this OS).")
 
 
 def ensure_connected(sess, quiet=False):
@@ -251,7 +384,7 @@ def ensure_connected(sess, quiet=False):
         if "connected" not in out or "cannot" in out or "failed" in out:
             raise RuntimeError(f"could not reach the cloud phone at {serial}: {out.strip()} "
                                "— `phone-harness cloud` shows whether it is still running")
-        _run("-s", serial, "shell", "unlock", sess["code"], timeout=20, check=False)
+        _run("-s", serial, "shell", "unlock", sess["link"]["code"], timeout=20, check=False)
         probe = _run("-s", serial, "shell", "echo", "ph-ok", timeout=15, check=False)
         if "ph-ok" not in probe:
             raise RuntimeError(f"the cloud phone at {serial} stayed locked; its unlock code "
@@ -264,35 +397,106 @@ def ensure_connected(sess, quiet=False):
     return serial
 
 
-def _attach(session, profile_id=None):
-    """Remember a ready session and connect to it."""
+def _link(session):
+    """How the helpers reach a ready session (see LINK_KINDS)."""
+    control = session.get("control") or {}
+    if control.get("url") and control.get("token"):
+        return {"kind": "control", "url": control["url"], "token": control["token"]}
+    _adb_present()
     adb = session.get("adb") or {}
     if not adb.get("host") or not adb.get("code"):
         # Only after someone turned ADB off for this session; ready phones have it.
         adb = _api("POST", f"/sessions/{session['id']}/adb")
-    state = _load_state()
-    state["session"] = {
-        "sid": session["id"], "host": adb["host"], "port": adb["port"],
-        "code": adb["code"], "profile": session.get("profile"),
-        "expires_at": session.get("expires_at"), "watch_url": session.get("watch_url"),
+    return {"kind": "adb", "host": adb["host"], "port": adb["port"], "code": adb["code"]}
+
+
+def _session_record(session, selector=None, label=None):
+    phone = session.get("phone")
+    return {
+        "sid": session["id"], "platform": session.get("platform"),
+        "kind": session.get("kind"),
+        "device_id": session.get("device_id") or (phone if isinstance(phone, str) else None),
+        "label": label or session.get("label"),
+        "profile": session.get("profile"), "expires_at": session.get("expires_at"),
+        "watch_url": session.get("watch_url"), "selector": selector,
+        "link": _link(session),
     }
-    if profile_id:
-        state["profile_id"] = profile_id
+
+
+def _store_session(record, make_attached=True):
+    """Remember a session. `make_attached` updates the terminal fallback.
+    Every remembered session stays addressable by `--session`, so a later
+    start does not forget the previous phone."""
+    state = _load_state()
+    sessions = _known_sessions(state)
+    sessions[record["sid"]] = record
+    state["sessions"] = sessions
+    if make_attached or not isinstance(state.get("session"), dict):
+        state["session"] = record
+    if make_attached and record.get("profile"):
+        state["profile_id"] = record["profile"]
     _save_state(state)
-    return ensure_connected(state["session"], quiet=True)
+    if record["link"]["kind"] == "adb":
+        ensure_connected(record, quiet=True)
+    return record
+
+
+def _attach(session, profile_id=None, selector=None, label=None):
+    """Remember a ready session and connect to it."""
+    record = _session_record(session, selector=selector, label=label)
+    if profile_id and not record.get("profile"):
+        record["profile"] = profile_id
+    return _store_session(record, make_attached=True)
+
+
+def _pull_pinned(pin):
+    """A pinned sid that this machine has not remembered yet. Raises when it
+    does not name one running session, so a helper does not fall through to
+    the phone on the desk."""
+    try:
+        sessions = _api("GET", "/sessions")
+    except CloudError as e:
+        raise RuntimeError(f"could not resolve --session {pin}: {_explain(e)}") from None
+    except OSError as e:
+        raise RuntimeError(f"could not resolve --session {pin}: {e}") from None
+    hits = [s for s in sessions if s.get("id") == pin] or [s for s in sessions if str(s.get("id", "")).startswith(pin)]
+    if len(hits) != 1:
+        raise RuntimeError(f"{pin!r} matches {len(hits)} running sessions"
+                           + (f": {', '.join(s['id'] for s in hits)}" if hits else ""))
+    session = hits[0]
+    if session.get("state") != "ready":
+        session = _wait_ready(session["id"])
+    return _store_session(_session_record(session), make_attached=False)
 
 
 def _detach(sid=None):
     state = _load_state()
-    sess = state.get("session")
-    if sess and (sid is None or sess.get("sid") == sid):
-        try:
-            from .android import _run
-            _run("disconnect", serial_of(sess), timeout=10, check=False)
-        except Exception:
-            pass
-        state.pop("session", None)
-        _save_state(state)
+    sessions = _known_sessions(state)
+    current = state.get("session") if isinstance(state.get("session"), dict) else None
+    if sid is None:
+        targeted = _as_linked(current)
+        sids = [targeted["sid"]] if targeted and targeted.get("sid") else []
+    else:
+        sids = [sid]
+    for target in sids:
+        rec = _as_linked(sessions.get(target))
+        if rec is None and current and current.get("sid") == target:
+            rec = _as_linked(current)
+        if rec and rec["link"]["kind"] == "adb":
+            try:
+                from .android import _run
+                _run("disconnect", serial_of(rec), timeout=10, check=False)
+            except Exception:
+                pass
+        sessions.pop(target, None)
+        if current and current.get("sid") == target:
+            state.pop("session", None)
+            current = None
+    if sessions:
+        state["sessions"] = sessions
+    else:
+        state.pop("sessions", None)
+    _save_state(state)
 
 
 # --- small things ------------------------------------------------------------
@@ -350,7 +554,7 @@ def _resolve_sid(given):
     if given is None:
         sess = attached()
         if not sess:
-            sys.exit("No cloud phone attached. `phone-harness cloud ls` lists running ones.")
+            sys.exit("No cloud phone attached. Pass --session SID, or `phone-harness cloud ls`.")
         return sess["sid"]
     ids = [s["id"] for s in _api("GET", "/sessions")]
     hits = [i for i in ids if i == given] or [i for i in ids if i.startswith(given)]
@@ -486,26 +690,154 @@ def _describe_profile(profile):
 
 # --- start / stop ------------------------------------------------------------
 
-def _wait_for_profile():
-    """-> the profile id once the saved phone is free to start, or
-    {"id", "session"} when a live session already holds it. A phone that was
-    just stopped is `running` (its session `closing`) and then `saving` for a
-    few seconds; starting it again should simply wait that out."""
+def _catalog(me):
+    available = me.get("available") if isinstance(me, dict) else None
+    return list(available) if isinstance(available, list) else []
+
+
+def _unnamed(me):
+    """What the service gives a start that names nothing: its own rule
+    (`GET /me` → `unnamed`), a temporary Android. Never a preference."""
+    rule = me.get("unnamed") if isinstance(me, dict) else None
+    if isinstance(rule, dict) and rule.get("platform"):
+        return {**rule, "temporary": bool(rule.get("temporary", True))}
+    return {"platform": "android", "kind": "emulator", "temporary": True}
+
+
+def _entry_selector(entry):
+    """What a later `cloud start` of the same phone matches against."""
+    if entry is None:
+        return "unnamed"
+    if entry.get("id"):
+        return "id:" + entry["id"]
+    if entry.get("temporary"):
+        return "temporary"
+    return "label:" + (entry.get("label") or "")
+
+
+def _match_catalog(catalog, query):
+    """Catalog entries named by id, label, or `ios`/`android` when only one
+    entry has that platform. Exact, case-insensitive. No partial matches."""
+    q = query.strip().lower()
+    by_id = [e for e in catalog if str(e.get("id") or "").lower() == q]
+    if by_id:
+        return by_id
+    by_label = [e for e in catalog if str(e.get("label") or "").lower() == q]
+    if by_label:
+        return by_label
+    if q in ("ios", "android"):
+        return [e for e in catalog if e.get("platform") == q]
+    return []
+
+
+def _format_catalog(catalog):
+    if not catalog:
+        return "  (nothing in this account's catalog)"
+    lines = []
+    for e in catalog:
+        note = "temporary" if e.get("temporary") else ""
+        lines.append(f"  {e.get('label') or 'phone':<18} {e.get('platform') or '':<8} "
+                     f"{e.get('id') or '-':<14} {e.get('state') or '-':<12} {note}".rstrip())
+    return "\n".join(lines)
+
+
+def _create_body(entry, timeout):
+    """The POST /sessions body for one catalog entry. A bare start (entry is
+    None) names nothing: the service applies GET /me → default. This is the
+    only place the CLI looks at platform, and only to choose device_id or
+    profile_id."""
+    body = {"timeout_seconds": timeout}
+    if entry is None:
+        return body
+    body["platform"] = entry.get("platform")
+    body["kind"] = entry.get("kind")
+    if entry.get("temporary"):
+        return body
+    if entry.get("platform") == "ios":
+        if entry.get("id"):
+            body["device_id"] = entry["id"]
+    elif entry.get("id"):
+        body["profile_id"] = entry["id"]
+    return body
+
+
+def _needs_adb(entry, me):
+    """An emulator link is adb. A device link is not. A bare start gets
+    what the service gives an unnamed start."""
+    chosen = entry if entry is not None else _unnamed(me)
+    return chosen.get("kind") != "device"
+
+
+def _starting_line(entry, me):
+    shown = entry if entry is not None else _unnamed(me)
+    if shown and shown.get("platform") == "ios":
+        label = shown.get("label") or shown.get("id") or ""
+        return f"Starting your iPhone{', ' + label if label else ''}…"
+    if shown and shown.get("temporary"):
+        return "Starting a temporary phone…"
+    if shown and shown.get("label"):
+        return f"Starting {shown['label']}…"
+    return "Starting your phone…"
+
+
+def _parse_for(text):
+    """Seconds. A bare number is minutes. `90s` is seconds. `15m` / `15min`
+    is minutes."""
+    t = str(text).strip().lower()
+    as_minutes = True
+    if t.endswith("min"):
+        t = t[:-3]
+    elif t.endswith("m"):
+        t = t[:-1]
+    elif t.endswith("s"):
+        t, as_minutes = t[:-1], False
+    n = _int(t, "--for")
+    return n * 60 if as_minutes else n
+
+
+def _already_running(session):
+    sid = (session or {}).get("id") or (session or {}).get("session") or "SID"
+    sys.exit(f"That phone is already running (session {sid}). "
+             f"Attach with `--session {sid}`.")
+
+
+def _saved_holder(entry, me):
+    """The profile id this start will occupy, when it is the saved Android.
+    None for a temporary phone, an iPhone, or a bare start whose default is
+    not that profile."""
+    shown = entry if entry is not None else _unnamed(me)
+    profile = (me.get("profile") or {}).get("id")
+    if not shown or not profile or shown.get("temporary") or shown.get("platform") == "ios":
+        return None
+    if shown.get("id") == profile:
+        return profile
+    return None
+
+
+def _wait_out_save(profile_id):
+    """The saved Android can be `saving` for a few seconds after stop. Wait
+    that out. If a ready session already holds it, say so and exit. -> None
+    when the phone is free to start."""
     deadline = time.monotonic() + SAVE_WAIT
     told = False
     while True:
-        profile = _api("GET", "/me").get("profile") or {}
+        me = _api("GET", "/me")
+        profile = me.get("profile") or {}
+        if profile.get("id") != profile_id:
+            return
         state = profile.get("state")
+        live = None
         if state == "running" and profile.get("session"):
             try:
                 live = _api("GET", f"/sessions/{profile['session']}")
             except CloudError:
                 live = None
-            if live and live["state"] in ("provisioning", "ready"):
-                print(f"Your phone is already running (session {live['id']}). Attaching to it.")
-                return {"id": profile.get("id"), "session": _wait_ready(live["id"])}
-        elif state != "saving":
-            return profile.get("id")
+            if live and live.get("state") in ("provisioning", "ready"):
+                _already_running(live)
+        if state not in ("saving", "running"):
+            return
+        if live and live.get("state") not in ("closing", None):
+            return
         if time.monotonic() >= deadline:
             sys.exit("Your phone is still shutting down from its last session. "
                      "Try again in a few seconds.")
@@ -515,72 +847,153 @@ def _wait_for_profile():
         time.sleep(3)
 
 
+def _reusable(selector):
+    """A session this machine already started for the same catalog choice,
+    still provisioning or ready. None when this start should create one."""
+    try:
+        state = _load_state()
+    except Exception:
+        return None
+    seen = set()
+    for rec in _known_sessions(state).values():
+        rec = _as_linked(rec)
+        if not rec or rec.get("sid") in seen or rec.get("selector") != selector:
+            continue
+        seen.add(rec["sid"])
+        try:
+            live = _api("GET", f"/sessions/{rec['sid']}")
+        except CloudError:
+            continue
+        if live.get("state") in ("provisioning", "ready"):
+            return live, rec
+    return None
+
+
+def _reject_removed(args):
+    gone = {
+        "--iphone": "name the phone instead: `cloud start ios` when that is unambiguous, or an id or label from `cloud ls`",
+        "--device": "pass the catalog id: `cloud start ID`",
+        "--temp": "start the temporary entry: `cloud start` with its label (see `cloud ls`)",
+        "--timeout": "pass the length with `--for` (`90s`, `15m`, or a number of minutes)",
+    }
+    for flag, hint in gone.items():
+        if flag in args:
+            sys.exit(f"{flag} was removed. {hint}.")
+
 
 def _start(args):
-    temp = _flag(args, "--temp")
+    args = list(args)
+    _reject_removed(args)
     watch = not _flag(args, "--no-watch")
-    minutes = _option(args, "--minutes", "-m")
-    if args:
+    for_opt = _option(args, "--for")
+    minutes_opt = _option(args, "--minutes", "-m")
+    if any(a.startswith("-") for a in args):
         sys.exit(CLI_USAGE)
-    from .android import _adb_bin
-    if not shutil.which(_adb_bin()):
-        sys.exit("adb is not installed, and it is how the helpers reach the phone. Install "
-                 "Android platform-tools first (macOS: brew install android-platform-tools; "
-                 "`phone-harness --doctor android` names it for this OS).")
+    if len(args) > 1:
+        sys.exit(CLI_USAGE)
+    # No name: this machine's own preference (`config set cloud.phone ...`),
+    # else whatever the service gives an unnamed start (a temporary Android).
+    configured = str(config.get("cloud.phone") or "").strip()
+    phone = args[0] if args else (configured or None)
+    if for_opt and minutes_opt:
+        sys.exit("Pass --for or --minutes, not both.")
     cap = int(config.get("cloud.max_minutes"))
-    minutes = _int(minutes, "--minutes") if minutes else int(config.get("cloud.minutes"))
-    if not 1 <= minutes <= cap:
-        sys.exit(f"--minutes must be between 1 and {cap} "
+    if for_opt:
+        timeout = _parse_for(for_opt)
+    elif minutes_opt:
+        timeout = _int(minutes_opt, "--minutes") * 60
+    else:
+        timeout = int(config.get("cloud.minutes")) * 60
+    if timeout < 1 or timeout > cap * 60:
+        sys.exit(f"Duration must be between 1 and {cap} minutes "
                  f"(raise the cap with `phone-harness config set cloud.max_minutes N`).")
 
-    current = attached()
-    if current:
+    me = _api("GET", "/me")
+    catalog = _catalog(me)
+    entry = None
+    if phone:
+        matches = _match_catalog(catalog, phone)
+        if not matches:
+            where = (" (from `config set cloud.phone`; clear it with `config unset cloud.phone`)"
+                     if not args else "")
+            sys.exit(f"No phone named {phone!r} is in this account's catalog{where}.\n"
+                     f"{_format_catalog(catalog)}")
+        if len(matches) > 1:
+            print(_format_catalog(matches))
+            if not sys.stdin.isatty():
+                sys.exit(f"{phone!r} matches {len(matches)} phones. "
+                         "Pass a catalog id or label.")
+            choice = input("Id or label: ").strip()
+            narrowed = _match_catalog(matches, choice)
+            if len(narrowed) != 1:
+                sys.exit(f"{choice!r} matches {len(narrowed)} phones.")
+            matches = narrowed
+        entry = matches[0]
+
+    if _needs_adb(entry, me):
+        _adb_present()
+
+    selector = _entry_selector(entry)
+    reused = _reusable(selector)
+    if reused:
+        live, rec = reused
+        print(f"Already attached to session {live['id']}; reusing it.")
+        return _report(_wait_ready(live["id"]), selector=selector,
+                       label=rec.get("label"), watch=False)
+
+    holder = _saved_holder(entry, me)
+    if holder:
+        _wait_out_save(holder)
+
+    # Another session may keep running. Say so, and how to aim at it again.
+    try:
+        previous = _as_linked(_load_state().get("session"))
+    except Exception:
+        previous = None
+    if previous and previous.get("selector") != selector:
         try:
-            live = _api("GET", f"/sessions/{current['sid']}")
+            still = _api("GET", f"/sessions/{previous['sid']}")
         except CloudError:
-            live = None
-        if live and live["state"] in ("provisioning", "ready"):
-            print(f"Already attached to session {live['id']}; reusing it.")
-            return _report(_wait_ready(live["id"]), watch=False)   # its view is already open
-        _detach()
+            still = None
+        if still and still.get("state") in ("provisioning", "ready"):
+            print(f"Session {previous['sid']} stays up. `--session {previous['sid']}` targets it.")
 
-    body = {"timeout_seconds": minutes * 60}
-    profile_id = None
-    if not temp:
-        profile_id = _wait_for_profile()
-        if isinstance(profile_id, dict):                  # it is already up: use it
-            return _report(profile_id["session"], profile_id["id"], watch)
-        if profile_id:
-            body["profile_id"] = profile_id
-
+    body = _create_body(entry, timeout)
+    label = (entry or {}).get("label")
     request_key = uuid.uuid4().hex
-    print("Starting a temporary phone…" if "profile_id" not in body
-          else "Starting your phone…")
+    print(_starting_line(entry, me))
     try:
         created = _api("POST", "/sessions", body, headers={"Idempotency-Key": request_key})
     except CloudError as e:
         if e.code == "profile_running":
-            sys.exit("Your phone is still shutting down from its last session. "
-                     "Try again in a few seconds.")
+            _already_running({"id": e.body.get("session")})
+        if e.code == "device_unavailable":
+            sys.exit(_explain(e))
+        if e.status == 400:
+            sys.exit(f"{_explain(e)}\n{_format_catalog(catalog)}")
         raise
     except OSError:
         # The request may have been admitted even though the answer was lost.
         created = _api("GET", f"/sessions/requests/{request_key}")
         if created.get("cleanup_complete") or not created.get("id"):
             raise
-    return _report(_wait_ready(created["id"]), profile_id, watch)
+    return _report(_wait_ready(created["id"]), selector=selector, label=label, watch=watch)
 
 
-def _report(session, profile_id=None, watch=True):
-    serial = _attach(session, profile_id)
+
+
+def _report(session, profile_id=None, watch=True, selector=None, label=None):
+    attached_now = _attach(session, profile_id, selector=selector, label=label)
     how = (session.get("startup") or {}).get("startup")
     note = {"exact": " Resumed exactly where you left it.",
             "rebooted": " Rebooted from saved storage: apps and logins kept, the screen is not."}
+    words = _kind_of_phone({**session, "link": attached_now["link"]}, label or attached_now.get("label"))
     print(f"✓ ready.{note.get(how, '')}")
-    print(f"  session  {session['id']}  ({'your phone' if session.get('profile') else 'temporary'})")
-    print(f"  adb      {serial} (connected, unlocked)")
+    print(f"  session  {session['id']}  ({words})")
+    link = attached_now["link"]["kind"]
+    print(f"  {link:<8} {_describe_link(attached_now)}" + (" (connected, unlocked)" if link == "adb" else ""))
     print(f"  expires  in {_left(session.get('expires_at'))} — `phone-harness cloud stop` "
-          "before then" + (" to keep the running state" if session.get("profile") else ""))
+          "before then" + (" to keep the running state" if _keeps_state(session) else ""))
     # The user asked for a phone; show it to them. Fails quietly where there
     # is no browser (an SSH box, CI), and the command is one line away.
     if watch and session.get("watch_url") and _open_browser(session["watch_url"]):
@@ -614,7 +1027,7 @@ def _stop(args):
     for sid in sids:
         try:
             before = _api("GET", f"/sessions/{sid}")
-            held_profile = held_profile or bool(before.get("profile"))
+            held_profile = held_profile or _keeps_state(before)
             _api("DELETE", f"/sessions/{sid}")
             print(f"✓ Session {sid} ended; billing stopped.")
         except CloudError as e:
@@ -664,7 +1077,8 @@ def _status(args):
             live = None
     # Just after `stop`, the API still says the profile is `running` while its
     # session is `closing`; the truth for the user is that it is being saved.
-    if live and live.get("state") == "closing" and live.get("profile"):
+    # A control link keeps its data on the phone, so closing it is not a save.
+    if live and live.get("state") == "closing" and _keeps_state(live):
         profile = {**profile, "state": "saving"}
     print(f"phone       {_describe_profile(profile)}")
     if not sess:
@@ -676,33 +1090,109 @@ def _status(args):
         print(f"session     {sess['sid']} is gone; detaching")
         _detach()
         return 0
-    state = "closing — saving the phone" if live["state"] == "closing" else live["state"]
+    state = ("closing — saving the phone"
+             if live["state"] == "closing" and _keeps_state(live)
+             else live["state"])
+    label = sess.get("label")
     print(f"session     {live['id']} · {state} · {_left(live.get('expires_at'))} left"
-          f" · {'your phone' if live.get('profile') else 'temporary'}")
-    print(f"adb         {serial_of(sess)}")
+          f" · {_kind_of_phone({**live, 'link': sess['link']}, label)}")
+    print(f"{sess['link']['kind']:<12}{_describe_link(sess)}")
     return 0
+
+
+def _session_key(session):
+    """The catalog id a live session belongs to: its device id or its profile."""
+    phone = session.get("phone")
+    if session.get("device_id"):
+        return session["device_id"]
+    if isinstance(phone, str) and phone:
+        return phone
+    return session.get("profile") or None
+
+
+def _session_on_entry(entry, session):
+    """True when this live session is that catalog phone.
+
+    An entry with an id matches the session's device id or profile. A
+    temporary entry has no id; a session with no device and no profile, on
+    the same platform, is that throwaway phone."""
+    key = _session_key(session)
+    if entry.get("id"):
+        return key == entry["id"]
+    if not entry.get("temporary") or key is not None or _link_kind(session) == "control":
+        return False
+    platform = entry.get("platform")
+    return not platform or session.get("platform") in (None, platform)
+
+
+def _ls_rows(me, sessions):
+    """One row per catalog entry, with a live session inlined when it is that
+    phone. Sessions that match nothing still appear, after the catalog."""
+    catalog = _catalog(me)
+    mine = (attached() or {}).get("sid")
+    used = set()
+
+    def session_blob(s):
+        return {"id": s.get("id"), "state": s.get("state"),
+                "left": _left(s.get("expires_at")), "expires_at": s.get("expires_at")}
+
+    rows = []
+    for entry in catalog:
+        match = None
+        for s in sessions:
+            if s.get("id") in used:
+                continue
+            if _session_on_entry(entry, s):
+                match = s
+                used.add(s["id"])
+                break
+        rows.append({
+            "label": entry.get("label") or "",
+            "platform": entry.get("platform"),
+            "id": entry.get("id"),
+            "state": entry.get("state"),
+            "temporary": bool(entry.get("temporary")),
+            "session": session_blob(match) if match else None,
+            "targeted": bool(match and match.get("id") == mine),
+        })
+    for s in sessions:
+        if s.get("id") in used:
+            continue
+        rows.append({
+            "label": s.get("device") or s.get("label") or "session",
+            "platform": s.get("platform"),
+            "id": None,
+            "state": s.get("state"),
+            "temporary": not s.get("profile") and _link_kind(s) != "control",
+            "session": session_blob(s),
+            "targeted": s.get("id") == mine,
+            "unmatched": True,
+        })
+    return rows
 
 
 def _ls(args):
     as_json = _flag(args, "--json")
-    limit = _option(args, "-n", "--limit")
+    if args:
+        sys.exit(CLI_USAGE)
+    me = _api("GET", "/me")
     sessions = _api("GET", "/sessions")
-    if limit:
-        sessions = sessions[:_int(limit, "-n")]
+    rows = _ls_rows(me, sessions)
     if as_json:
-        print(json.dumps(sessions, indent=2))
+        print(json.dumps(rows, indent=2))
         return 0
-    if not sessions:
-        print("Nothing is running.")
+    if not rows:
+        print("No phones in this account's catalog.")
         return 0
-    mine = (attached() or {}).get("sid")
-    print(f"  {'SESSION':<14} {'STATE':<13} {'PHONE':<10} {'LEFT':<8} ADB")
-    for s in sessions:
-        adb = s.get("adb") or {}
-        print(f"{'*' if s['id'] == mine else ' '} {s['id']:<14} {s['state']:<13} "
-              f"{'yours' if s.get('profile') else 'temporary':<10} "
-              f"{_left(s.get('expires_at')):<8} "
-              f"{adb.get('host', '-')}{':' + str(adb['port']) if adb.get('port') else ''}")
+    print(f"{'':1} {'LABEL':<18} {'PLATFORM':<8} {'ID':<14} {'STATE':<12} {'NOTE':<10} "
+          f"{'SESSION':<14} LEFT")
+    for row in rows:
+        sess = row.get("session") or {}
+        note = "temporary" if row.get("temporary") else ""
+        print(f"{'*' if row.get('targeted') else ' '} {row.get('label') or '':<18} "
+              f"{row.get('platform') or '':<8} {row.get('id') or '-':<14} "
+              f"{row.get('state') or '-':<12} {note:<10} "
+              f"{sess.get('id') or '-':<14} {sess.get('left') or ''}".rstrip())
     return 0
 
 
@@ -713,12 +1203,15 @@ def _show(args):
         print(json.dumps(session, indent=2))
         return 0
     adb = session.pop("adb", None) or {}
+    control = session.pop("control", None) or {}
     session.pop("watch_url", None)          # a credential; `cloud watch` opens it
     for k, v in session.items():
         if v not in (None, "", {}):
             print(f"{k:<16} {json.dumps(v) if isinstance(v, (dict, list)) else v}")
     if adb.get("host"):
         print(f"{'adb':<16} {adb['host']}:{adb['port']}")
+    if control.get("url"):
+        print(f"{'control':<16} {control['url']}")
     return 0
 
 
@@ -726,8 +1219,9 @@ def _use(args):
     if len(args) != 1:
         sys.exit("Usage: phone-harness cloud use SID")
     session = _wait_ready(_resolve_sid(args[0]))
-    serial = _attach(session)
-    print(f"✓ attached to {session['id']} at {serial}")
+    sess = _attach(session)
+    print(f"✓ attached to {session['id']}; {_describe_link(sess)}")
+    print("Helpers with no --session and no PHONE_HARNESS_SESSION follow this one.")
     return 0
 
 
@@ -743,7 +1237,11 @@ def _watch(args):
 
 def _open(args):
     """The dashboard: the interactive viewer, behind the user's own sign-in.
-    `watch` is for looking; this is for taking the controls."""
+    `watch` is for looking; this is for taking the controls. An optional SID
+    checks that the session exists; the page is still the account dashboard."""
+    if args and args[0] != "--print":
+        _resolve_sid(args[0])
+        args = args[1:]
     url = _dashboard()
     if _flag(args, "--print") or not _open_browser(url):
         print(url)
@@ -766,10 +1264,11 @@ def _whoami(args):
 def _phone(args):
     if args[:1] == ["reset"]:
         if "--yes" not in args:
-            sys.exit("This forgets your saved phone — its apps, logins and data — and cannot "
-                     "be undone.\nRun: phone-harness cloud phone reset --yes")
+            sys.exit("This wipes the saved Android's stored state — its apps, logins and "
+                     "data — and cannot be undone. The CLI has no iPhone reset; that is "
+                     "the operator's.\nRun: phone-harness cloud phone reset --yes")
         _api("POST", "/me/profile/reset")
-        print("Your saved phone was reset. The next `cloud start` begins fresh.")
+        print("Wiped the saved Android's stored state. The next start of that phone begins fresh.")
         return 0
     profile = _api("GET", "/me").get("profile") or {}
     print(json.dumps(profile, indent=2) if _flag(args, "--json") else _describe_profile(profile))
@@ -828,26 +1327,36 @@ def _history(args):
 # --- CLI (phone-harness cloud ...) -------------------------------------------
 
 CLI_USAGE = """Usage:
-  phone-harness cloud                          who is signed in, what is attached
+  phone-harness cloud [--session SID]          who is signed in, what is attached
   phone-harness cloud login [--no-browser]     sign in through the browser
   phone-harness cloud logout | whoami
-  phone-harness cloud start [--temp] [--minutes N] [--no-watch]
-                                               start your saved phone (or a throwaway one), connect,
-                                               and open its live view (config: cloud.watch)
+  phone-harness cloud ls [--json]              the account catalog, with live sessions inlined
+                                               (* = the session this process targets)
+  phone-harness cloud start [PHONE] [--for DURATION] [--no-watch]
+                                               PHONE is a catalog id or label, or ios/android
+                                               when only one entry has that platform. No PHONE
+                                               starts cloud.phone (config set cloud.phone NAME),
+                                               else a temporary Android, the service's rule for an
+                                               unnamed start. --for is 90s, 15m, or
+                                               minutes (default 15, cap cloud.max_minutes).
+                                               --minutes N is the same thing, deprecated.
+                                               Opens the live view (cloud.watch)
   phone-harness cloud stop [SID|--all] [--wait]
-                                               end it; your phone is saved for next time
-                                               (--wait watches the save finish)
-  phone-harness cloud ls [-n NUM]              running sessions (* = attached)
-  phone-harness cloud show [SID]               one session in full
-  phone-harness cloud use SID                  attach the helpers to another running session
+                                               end it. An adb phone with a saved profile is saved;
+                                               a control link (an iPhone) keeps its own data
+                                               (--wait watches an Android save finish)
+  phone-harness cloud show [SID] [--json]      one session in full
+  phone-harness cloud use SID                  point the terminal fallback at a running session
   phone-harness cloud watch [SID] [--print]    the read-only live view (no sign-in; shareable)
-  phone-harness cloud open [--print]           the dashboard: control the phone yourself (sign-in)
-  phone-harness cloud phone [reset --yes]      your saved phone
+  phone-harness cloud open [SID] [--print]     the dashboard: control the phone yourself (sign-in)
+  phone-harness cloud phone [reset --yes]      the saved Android. reset --yes wipes its stored state
   phone-harness cloud keys [create [LABEL] | revoke HASH]   API keys, for CI
-  phone-harness cloud history [-n NUM]
-ls, show, whoami, phone, keys and history take --json. SID may be a unique prefix.
-PHONE_HARNESS_CLOUD_API, _OAUTH_ISSUER, _OAUTH_CLIENT_ID and _PROXY_TOKEN point the CLI
-at a Phone Harness instance of your own (or a gated one); unset, it is the public cloud.
+  phone-harness cloud history [-n NUM] [--json]
+Every command takes --session SID, or PHONE_HARNESS_SESSION, and so do helper
+scripts: that pins one phone for this process. With neither, helpers follow the
+attached session (the last start, or cloud use). SID may be a unique prefix.
+PHONE_HARNESS_CLOUD_API, _OAUTH_ISSUER and _OAUTH_CLIENT_ID point the CLI
+at a Phone Harness instance of your own; unset, it is the public cloud.
 They may live in a .env file at the repo root or in the agent workspace (never committed).
 """
 
@@ -858,6 +1367,9 @@ _COMMANDS = {"login": _login, "logout": _logout, "whoami": _whoami, "start": _st
 
 def cli(args):
     args = list(args)
+    pinned = _option(args, "--session")
+    if pinned:
+        os.environ["PHONE_HARNESS_SESSION"] = pinned
     fn = _status if not args else _COMMANDS.get(args[0])
     if fn is None:
         print(CLI_USAGE)

@@ -1,6 +1,7 @@
 """The phone-harness CLI: exec Python from stdin with helpers pre-imported."""
 import functools
 import io
+import os
 import sys
 import time
 from pathlib import Path
@@ -13,12 +14,45 @@ USAGE = """Usage:
   PY
 
 Commands:
+  phone-harness --session SID <<'PY'   pin one cloud phone for this process
   phone-harness --doctor [ios|android]   diagnose the phone the helpers would drive
   phone-harness skill       print the phone-harness skill text
   phone-harness android ... pair/connect/choose an Android phone
-  phone-harness cloud ...   rent a cloud phone: `cloud login`, `cloud start`, `cloud stop`
+  phone-harness cloud ...   rent a catalog phone: `cloud login`, `cloud ls`, `cloud start [PHONE]`
   phone-harness config ...  settings: `config set platform android`
+
+--session SID (or PHONE_HARNESS_SESSION) selects one rented phone. With neither,
+a script follows the attached session.
 """
+
+
+def _write_utf8(text):
+    """Write text as UTF-8.
+
+    Windows pipes and consoles often use cp1252 (`phone-harness skill > file`).
+    Reconfigure the text stream when it allows it; if that still cannot encode
+    the text, write UTF-8 bytes to the buffer.
+    """
+    out = sys.stdout
+    try:
+        out.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, OSError, ValueError):
+        pass
+    try:
+        out.write(text)
+        out.flush()
+        return
+    except UnicodeEncodeError:
+        pass
+    data = text.encode("utf-8", errors="replace")
+    buf = getattr(out, "buffer", None)
+    if buf is not None:
+        buf.write(data)
+        buf.flush()
+        return
+    encoding = getattr(out, "encoding", None) or "ascii"
+    out.write(data.decode(encoding, errors="replace"))
+    out.flush()
 
 
 def _skill_text():
@@ -210,8 +244,27 @@ def main():
     )
 
 
+def _take_session(args):
+    """Pull `--session SID` off the front of any command, including a script.
+    The flag wins over PHONE_HARNESS_SESSION already in the environment."""
+    out, i, pinned = [], 0, None
+    while i < len(args):
+        if args[i] == "--session":
+            if i + 1 >= len(args):
+                sys.exit("--session needs a SID")
+            pinned = args[i + 1]
+            i += 2
+            continue
+        out.append(args[i])
+        i += 1
+    if pinned:
+        os.environ["PHONE_HARNESS_SESSION"] = pinned
+    return out
+
+
 def _run(args):
     global _phone_name
+    args = _take_session(args)
     if args and args[0] in {"-h", "--help"}:
         print(USAGE)
         return
@@ -228,7 +281,7 @@ def _run(args):
         from .config import cli
         sys.exit(cli(args[1:]))
     if args and args[0] == "skill":
-        print(_skill_text(), end="")
+        _write_utf8(_skill_text())
         return
     if args or sys.stdin.isatty():
         sys.exit(USAGE)

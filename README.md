@@ -4,7 +4,8 @@
 
 Connect Claude Code, Codex, or any agent to your real phone. **iPhone** through
 the Mac's iPhone Mirroring window, **Android** over adb from macOS, Linux or
-Windows. No jailbreak, no
+Windows, or a Phone Harness Cloud phone — an Android over adb, or an iPhone
+over HTTPS. No jailbreak, no
 Xcode, nothing installed on the phone. The agent sees the screen, taps, types,
 and reads the result.
 
@@ -60,18 +61,26 @@ guide; [helpers.py](src/phone_harness/helpers.py) is the full list.
 ## No phone on your desk? Rent one
 
 ```bash
-phone-harness cloud login     # once: approve in your browser
-phone-harness cloud start     # your own Android phone; apps and logins are kept
+phone-harness cloud login            # once: approve in your browser
+phone-harness cloud ls               # phones on the account, and any live session
+phone-harness cloud start            # cloud.phone if set, else a temporary Android; 15 min (--for 90s, 15m)
+phone-harness cloud start ios        # the account's iPhone, when only one is listed
 phone-harness <<'PY'
 print(screenshot())
 PY
-phone-harness cloud stop      # billing stops, the phone is saved
+phone-harness cloud stop             # billing stops; a saved Android is written back
 ```
 
-[Phone Harness Cloud](https://phone-harness.com/cloud) phones are Android
-phones reached over adb, so every helper works on them unchanged and there is
-nothing to export or select. `phone-harness cloud` lists the rest: `ls`,
-`watch`, `history`, and `start --temp` for a throwaway phone.
+`cloud ls` is the catalog (`GET /me` → `available`): each phone's label,
+platform, and id, with a live session on that row. `cloud start` with no name
+starts this machine's `cloud.phone` setting if one is set, else what the
+service gives an unnamed start, a temporary Android. A name is a catalog id or label, or `ios` /
+`android` when only one entry has that platform. A [cloud Android](https://phone-harness.com/cloud)
+is reached over adb, so every helper works on it unchanged. A cloud iPhone has
+no shell: the helpers POST ops over HTTPS, OCR runs on the host, and driving
+it is in [SKILL.md](SKILL.md). `phone-harness cloud` lists the rest, including
+`watch`, `open`, `history`, and `phone` for the saved Android. `--session SID`
+(or `PHONE_HARNESS_SESSION`) pins one rented phone for this process.
 
 ## How it works
 
@@ -84,8 +93,13 @@ HID-level events for taps, swipes, and typing.
 accessibility tree is the text source, `input` is the hands. Works over USB or
 Wi‑Fi, no window needed.
 
-Same helpers on both. `phone-harness config set platform ios|android` picks
-the default.
+**Cloud iPhone.** `phone-harness cloud start` with that phone's catalog id,
+label, or `ios` when it is the only one, drives it over HTTPS from any OS.
+The host runs OCR; taps use the phone's screen points. No adb and no
+accessibility tree. Day-to-day steps are in [SKILL.md](SKILL.md).
+
+Same helpers throughout. `phone-harness config set platform ios|android` picks
+the desk default.
 
 ## Limits
 

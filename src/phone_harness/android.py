@@ -191,7 +191,7 @@ class Android(Backend):
         if not self._resolved and self._resolve() is None:
             self._session_require()               # raises with the physical step
         from . import cloud
-        rented = cloud.attached()
+        rented = cloud.attached("adb")
         if not rented or os.environ.get("ANDROID_SERIAL") != cloud.serial_of(rented):
             return _run(*args, binary=binary, timeout=timeout)
         # A rented phone is reached over the internet, and every new connection
@@ -225,7 +225,7 @@ class Android(Backend):
             self._resolved = True
             return os.environ["ANDROID_SERIAL"]
         from . import cloud
-        rented = cloud.attached()
+        rented = cloud.attached("adb")
         if rented:
             # Not remembered below: its address is reused by other phones.
             os.environ["ANDROID_SERIAL"] = cloud.ensure_connected(rented)
@@ -690,7 +690,7 @@ CLI_USAGE = """Usage:
   phone-harness android forget NAME
   phone-harness android awake [--bg] [--no-mirror]
         keep the phone awake for a session (and mirror it if scrcpy is
-        installed); changes no phone settings — ends with rest, Ctrl-C, or
+        installed); changes no phone settings - ends with rest, Ctrl-C, or
         closing the mirror. --bg detaches.
   phone-harness android rest                     end the session; the phone sleeps
 """

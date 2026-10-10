@@ -1,9 +1,12 @@
 # phone-harness install
 
-phone-harness drives a real phone from a Mac (first-run flow for agents:
-`onboarding.md`; day-to-day usage: `SKILL.md`). It works with an **iPhone** through the macOS
-iPhone Mirroring app, or an **Android** over adb (USB or Wi‑Fi). Same helpers
-either way; you choose a default and can switch per call.
+phone-harness drives a real phone (first-run flow for agents: `onboarding.md`;
+day-to-day usage: `SKILL.md`). It works with an **iPhone** through the macOS
+iPhone Mirroring app, an **Android** over adb (USB or Wi‑Fi), or a phone from
+Phone Harness Cloud — an Android over adb, or an iPhone the helpers drive over
+HTTPS (`phone-harness cloud start` with that phone's name from `cloud ls`).
+Same helpers either way; you
+choose a default and can switch per call.
 
 ## Common
 
@@ -19,7 +22,8 @@ mkdir -p "${CODEX_HOME:-$HOME/.codex}/skills/phone-harness"
 phone-harness skill > "${CODEX_HOME:-$HOME/.codex}/skills/phone-harness/SKILL.md"
 ```
 
-- Python 3.10+, any OS. **iPhone needs a Mac** (it drives iPhone Mirroring);
+- Python 3.10+, any OS. **iPhone Mirroring needs a Mac.** A cloud iPhone
+  (`cloud start` of the iOS catalog entry) is driven over HTTPS from any OS.
   **Android works on macOS, Linux and Windows** and is the default off a Mac.
   Only the CLI? `pip install phone-harness` works too; the
   checkout is what makes the harness editable (`agent-workspace/agent_helpers.py`).
@@ -31,9 +35,13 @@ phone-harness skill > "${CODEX_HOME:-$HOME/.codex}/skills/phone-harness/SKILL.md
 
 Re-run the `phone-harness skill > …/SKILL.md` lines after pulling updates so
 the agent's copy matches the code.
-- **No phone on your desk?** `phone-harness cloud login` then
-  `phone-harness cloud start` rents your own Android in the cloud; new accounts
-  get $5 of credit (100 minutes). It needs only adb (below) — nothing to pair.
+- **No phone on your desk?** `phone-harness cloud login`, then
+  `phone-harness cloud ls` and `phone-harness cloud start` (the account
+  default) or `phone-harness cloud start PHONE` for a catalog id, label, or
+  `ios` / `android` when that names one phone. An Android needs adb, below.
+  An iPhone needs no adb and no Mac; driving it is **Cloud iPhone** in
+  `SKILL.md`. A start lasts 15 minutes unless you pass `--for` (`90s`, `15m`,
+  or a number of minutes). New accounts get $5 of credit (100 minutes).
 
 ## iPhone
 
@@ -78,8 +86,9 @@ the agent's copy matches the code.
 ## Both
 
 Set up each as above; `phone-harness config set platform …` picks the default,
-`PHONE_HARNESS_PLATFORM=…` picks per call. The two never interfere — the
-iPhone is driven through the mirroring window, the Android over adb.
+`PHONE_HARNESS_PLATFORM=…` picks per call. The desk phones never interfere —
+the iPhone is driven through the mirroring window, the Android over adb. A
+cloud iPhone is a third path: HTTPS ops, covered in `SKILL.md`.
 
 `phone-harness config set telemetry false` turns off anonymous usage telemetry.
 
