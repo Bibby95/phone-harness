@@ -129,8 +129,15 @@ There are two things. A **phone** is a row in the account catalog (`GET /me`
 -> `available`): a label, a platform, an id, and whether it is a temporary
 phone. The service keeps no default phone; a preference is the chooser's. A **session** is one of those phones rented right now.
 `cloud ls` prints one row per catalog phone and writes any live session on
-that row (`*` is the session this process targets). A running session that
-matches no row is still listed.
+that row (`*` is the session this process targets). A session lines up with
+the row that has the same device_id or profile_id; a session with neither
+lines up with the temporary row. A cloud iPhone session does not echo that
+id: its `device` is the word "iPhone", and its `profile` (`iphone-...`) matches
+no catalog row. The catalog row's `state` is `running` while a session holds
+it. A session whose ids match no row counts as unmatched. When exactly one
+row of that platform and kind is `running` and exactly one unmatched session
+has that same platform and kind, the session is written on that row. A
+session that still matches nothing is listed on its own.
 
 `cloud start` with no name starts this machine's `cloud.phone` setting
 (`config set cloud.phone "Desk phone"`) when one is set; otherwise it sends
@@ -460,3 +467,18 @@ overrides that. Installs seed that directory from the packaged defaults
 when it does not exist yet; an existing workspace is left as it is.
 To get a fresh default, delete the workspace folder; it is recreated
 on the next run. For setup or permission problems, read `install.md`.
+
+## Updates
+
+`phone-harness update` brings this install up to date. A uv tool runs
+`uv tool upgrade phone-harness`. A git checkout runs `git pull --ff-only`
+in that checkout. Anything else prints `pip install -U phone-harness` and
+does not run it. The CLI never updates itself. Once a day, on a terminal,
+it may print one stderr line when PyPI has a newer version:
+
+```
+phone-harness X.Y.Z is available (you have A.B.C): run phone-harness update
+```
+
+Relay that line to the user. `PHONE_HARNESS_NO_UPDATE_CHECK=1` turns the
+notice off. A network problem never fails the command.
