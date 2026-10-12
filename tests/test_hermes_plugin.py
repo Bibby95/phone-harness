@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import types
 import unittest
 from pathlib import Path
 from typing import Any
@@ -39,6 +40,7 @@ class FakeCtx:
 
     def __init__(self):
         self.tools, self.hooks, self.skills = {}, {}, {}
+        self.settings = {}
 
     def register_tool(self, name, toolset, schema, handler, **kw):
         self.tools[name] = dict(toolset=toolset, schema=schema, handler=handler, **kw)
@@ -48,6 +50,9 @@ class FakeCtx:
 
     def register_skill(self, name, path, description="", frontmatter=None):
         self.skills[name] = {"path": path, "description": description, "frontmatter": dict(frontmatter or {})}
+
+    def get_config(self, key, default=None):
+        return self.settings.get(key, default)
 
 
 class Base(unittest.TestCase):
@@ -63,9 +68,71 @@ class Base(unittest.TestCase):
         self.plugin._packaged_skill = lambda: None
         self.ctx = FakeCtx()
         self.plugin.register(self.ctx)
+        # The suffix scrub, not a Hermes install that may or may not be on this machine.
+        self._saved_modules = {name: sys.modules.get(name) for name in (
+            "tools", "tools.environments", "tools.environments.local",
+            "tools.vision_tools", "tools.vision_tools_history_budget",
+        )}
+        tools = types.ModuleType("tools")
+        tools.__path__ = []
+        environments = types.ModuleType("tools.environments")
+        environments.__path__ = []
+        local = types.ModuleType("tools.environments.local")
+        tools.environments = environments
+        environments.local = local
+        sys.modules["tools"] = tools
+        sys.modules["tools.environments"] = environments
+        sys.modules["tools.environments.local"] = local
+        sys.modules.pop("tools.vision_tools", None)
+        sys.modules.pop("tools.vision_tools_history_budget", None)
+        self.addCleanup(self._restore_modules)
+
+    def _restore_modules(self):
+        for name, module in self._saved_modules.items():
+            if module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
 
     def run_tool(self, code, **args):
-        return json.loads(self.plugin.phone_exec({"code": code, **args}))
+        result = self.plugin.phone_exec({"code": code, **args})
+        if isinstance(result, dict) and result.get("_multimodal"):
+            result = result["text_summary"]
+        return json.loads(result)
+
+    def save_code(self, path: Path) -> str:
+        return (
+            "from pathlib import Path\n"
+            f"p = Path({str(path)!r})\n"
+            "p.write_bytes(b'img')\n"
+            "print(p)\n"
+        )
+
+    def install_vision(self, *, native=True, resize=None, embed_bytes=256_000, max_dimension=1568):
+        tools = sys.modules["tools"]
+        vision = types.ModuleType("tools.vision_tools")
+        budget = types.ModuleType("tools.vision_tools_history_budget")
+        calls = []
+
+        def default_resize(path, mime_type=None, max_base64_bytes=None, max_dimension=None, force_jpeg=False):
+            calls.append({
+                "path": Path(path),
+                "mime_type": mime_type,
+                "max_base64_bytes": max_base64_bytes,
+                "max_dimension": max_dimension,
+                "force_jpeg": force_jpeg,
+            })
+            return "data:image/jpeg;base64,qq"
+
+        vision._EMBED_MAX_DIMENSION = max_dimension
+        vision._should_use_native_vision_fast_path = lambda: native
+        vision._resize_image_for_vision = resize or default_resize
+        budget.resolve_embed_target_bytes = lambda: embed_bytes
+        tools.vision_tools = vision
+        tools.vision_tools_history_budget = budget
+        sys.modules["tools.vision_tools"] = vision
+        sys.modules["tools.vision_tools_history_budget"] = budget
+        return calls
 
 
 class Registration(Base):
@@ -80,6 +147,8 @@ class Registration(Base):
         description = self.ctx.tools["phone_exec"]["schema"]["description"]
         self.assertIn("ensure_device()", description)
         self.assertIn("screen()", description)
+        self.assertIn("screenshot()", description)
+        self.assertIn("attached", description)
         self.assertIn("phone-harness:phone-harness", description)
         self.assertIn("passwords", description)
         self.assertNotIn("scroll_until", description)
@@ -88,33 +157,90 @@ class Registration(Base):
 class ApprovalGate(Base):
     PHONE_ONLY = [
         'ensure_device()\nprint([o["text"] for o in screen()][:10])',
-        'import json, re, time\nprint(json.dumps(screen_info()))',
+        'from phone_harness.helpers import screen\nprint(screen())',
         'from phone_harness import helpers\nhelpers.tap_text("Weather")',
-        'from collections import Counter\nprint(Counter(o["text"] for o in ocr()))',
-        'def (',  # a SyntaxError cannot run, so there is nothing to approve
+        'import phone_harness.helpers as helpers\nprint(helpers.screen_info())',
+        'send("screen.text")',
+        'send("input.tap", x=1, y=2)',
+        'send("input.text", s="raw")',
+        's = send\ns("screen.capture")',
+        'def (',  # a SyntaxError cannot run, so the classifier has nothing to approve
     ]
     PAST_THE_PHONE = [
-        "import os", "import subprocess", "import os.path", "from os import path", "import Quartz",
-        "from . import agent_helpers", 'open("notes.txt", "w").write("x")', '__import__("os")',
-        'eval("1")', "print.__self__", 'getattr(print, "__self__")', 'shell("pm list packages")',
+        "import os", "import json", "import subprocess", "import os.path", "from os import path",
+        "from collections import Counter",
+        "import Quartz", "import phone_harness", "import phone_harness.transport",
+        "from phone_harness import transport", "from phone_harness.helpers import Path",
+        "from phone_harness.helpers import importlib", "from . import agent_helpers",
+        'open("notes.txt", "w").write("x")', '__import__("os")', 'eval("1")',
+        "print.__self__", 'getattr(print, "__self__")', 'shell("pm list packages")',
+        'send("raw", cmd="id")', 'send(op="raw")', 'op = "raw"\nsend(op)',
+        'f = open\nf("/etc/passwd")', 's = send\ns("raw", cmd="id")',
+        'phone.send("raw", cmd="id")',
+        'from phone_harness.helpers import shell as sh\nsh("id")',
+        'a = open\nb = a\nb("x")',
+        'import phone_harness.helpers as helpers\nprint(helpers.Path.home())',
     ]
+
+    def setUp(self):
+        super().setUp()
+        self._saved_auto = os.environ.pop(self.plugin.CLASSIFIER_AUTO_RUN_ENV, None)
+        self.addCleanup(self._restore_auto)
+
+    def _restore_auto(self):
+        if self._saved_auto is None:
+            os.environ.pop(self.plugin.CLASSIFIER_AUTO_RUN_ENV, None)
+        else:
+            os.environ[self.plugin.CLASSIFIER_AUTO_RUN_ENV] = self._saved_auto
 
     def hook(self, code, tool="phone_exec"):
         return self.ctx.hooks["pre_tool_call"](tool_name=tool, args={"code": code}, task_id="t")
 
-    def test_phone_scripts_run_without_asking(self):
+    def test_every_phone_exec_asks_by_default(self):
+        for code in self.PHONE_ONLY + self.PAST_THE_PHONE:
+            with self.subTest(code=code):
+                directive = self.hook(code)
+                self.assertEqual(directive["action"], "approve")
+                self.assertEqual(directive["rule_key"], "phone_exec")
+                self.assertIn("phone_exec", directive["message"])
+                self.assertLessEqual(len(directive["message"]), 180)
+
+    def test_the_default_message_describes_the_script(self):
+        directive = self.hook('ensure_device()\nprint(screen())')
+        self.assertIn("ensure_device()", directive["message"])
+        self.assertIn("print(screen())", directive["message"])
+
+    def test_phone_only_scripts_are_quiet_only_after_opt_in(self):
+        os.environ[self.plugin.CLASSIFIER_AUTO_RUN_ENV] = "1"
         for code in self.PHONE_ONLY:
             with self.subTest(code=code):
                 self.assertIsNone(self.plugin.approval_reason(code))
                 self.assertIsNone(self.hook(code))
 
-    def test_scripts_that_reach_past_the_phone_ask_first(self):
+    def test_opt_in_still_asks_for_scripts_that_reach_past_the_phone(self):
+        os.environ[self.plugin.CLASSIFIER_AUTO_RUN_ENV] = "1"
         for code in self.PAST_THE_PHONE:
             with self.subTest(code=code):
-                self.assertIsNotNone(self.plugin.approval_reason(code))
+                self.assertIsNotNone(self.plugin.approval_reason(code), code)
                 directive = self.hook(code)
                 self.assertEqual(directive["action"], "approve")
+                self.assertEqual(directive["rule_key"], "phone_exec")
                 self.assertIn("phone_exec", directive["message"])
+                self.assertIn("heuristic", directive["message"])
+
+    def test_the_plugin_setting_opts_into_auto_run_when_the_env_var_is_unset(self):
+        self.ctx.settings[self.plugin.CLASSIFIER_AUTO_RUN] = True
+        self.assertIsNone(self.hook("print(screen())"))
+        asked = self.hook('send("raw", cmd="id")')
+        self.assertEqual(asked["rule_key"], "phone_exec")
+        self.assertEqual(asked["action"], "approve")
+
+    def test_an_explicit_env_var_off_beats_the_plugin_setting(self):
+        self.ctx.settings[self.plugin.CLASSIFIER_AUTO_RUN] = True
+        os.environ[self.plugin.CLASSIFIER_AUTO_RUN_ENV] = "0"
+        directive = self.hook("print(screen())")
+        self.assertEqual(directive["action"], "approve")
+        self.assertEqual(directive["rule_key"], "phone_exec")
 
     def test_other_tools_are_left_alone(self):
         self.assertIsNone(self.hook("import os", tool="terminal"))
@@ -145,6 +271,64 @@ class Environment(Base):
         env = self.plugin._env(self.data / "ws")
         self.assertNotIn("PHONE_HARNESS_PLATFORM", env)
         self.assertEqual(env["PHONE_HARNESS_TELEMETRY"], "0")
+
+    def test_secret_suffixes_are_removed_and_phone_harness_vars_stay(self):
+        saved = dict(os.environ)
+        self.addCleanup(lambda: (os.environ.clear(), os.environ.update(saved)))
+        os.environ["OPENAI_API_KEY"] = "sk-test"
+        os.environ["GH_TOKEN"] = "ghp-test"
+        os.environ["DB_SECRET"] = "s3cret"
+        os.environ["openai_api_key"] = "sk-lower"
+        os.environ["PHONE_HARNESS_PLATFORM"] = "android"
+        os.environ["PHONE_HARNESS_CUSTOM"] = "kept"
+        os.environ["PHONE_HARNESS_API_KEY"] = "ph-key"
+        os.environ["PATH"] = "/usr/bin:/bin"
+        os.environ["HOME"] = "/home/me"
+        os.environ["ANDROID_HOME"] = "/opt/android"
+        os.environ["ANDROID_SERIAL"] = "emulator-5554"
+        env = self.plugin._env(self.data / "ws")
+        for gone in ("OPENAI_API_KEY", "GH_TOKEN", "DB_SECRET", "openai_api_key"):
+            self.assertNotIn(gone, env)
+        self.assertEqual(env["PHONE_HARNESS_PLATFORM"], "android")
+        self.assertEqual(env["PHONE_HARNESS_CUSTOM"], "kept")
+        self.assertEqual(env["PHONE_HARNESS_API_KEY"], "ph-key")
+        self.assertEqual(env["PATH"], "/usr/bin:/bin")
+        self.assertEqual(env["HOME"], "/home/me")
+        self.assertEqual(env["ANDROID_HOME"], "/opt/android")
+        self.assertEqual(env["ANDROID_SERIAL"], "emulator-5554")
+        self.assertEqual(env["PH_CLIENT"], "hermes")
+        self.assertEqual(env["PH_AGENT_WORKSPACE"], str(self.data / "ws"))
+
+    def test_hermes_subprocess_env_is_used_when_it_imports(self):
+        saved = dict(os.environ)
+        self.addCleanup(lambda: (os.environ.clear(), os.environ.update(saved)))
+        os.environ["OPENAI_API_KEY"] = "sk-test"
+        os.environ["PHONE_HARNESS_PLATFORM"] = "ios"
+        os.environ["PHONE_HARNESS_CUSTOM"] = "kept"
+        os.environ["PHONE_HARNESS_API_KEY"] = "ph-key"
+        os.environ.pop("PHONE_HARNESS_TELEMETRY", None)
+        os.environ["PHONE_HARNESS_HOME"] = str(self.data)
+
+        def hermes_subprocess_env():
+            return {"PATH": "/from-hermes", "HOME": "/home/hermes", "ANDROID_SERIAL": "emulator-5554",
+                    "LANG": "C"}
+
+        sys.modules["tools.environments.local"].hermes_subprocess_env = hermes_subprocess_env
+        env = self.plugin._env(self.data / "ws")
+        self.assertEqual(env["PATH"], "/from-hermes")
+        self.assertEqual(env["HOME"], "/home/hermes")
+        self.assertEqual(env["ANDROID_SERIAL"], "emulator-5554")
+        self.assertNotIn("OPENAI_API_KEY", env)
+        self.assertEqual(env["PHONE_HARNESS_PLATFORM"], "ios")
+        self.assertEqual(env["PHONE_HARNESS_CUSTOM"], "kept")
+        self.assertEqual(env["PHONE_HARNESS_API_KEY"], "ph-key")
+        self.assertEqual(env["PH_CLIENT"], "hermes")
+        self.assertEqual(env["PHONE_HARNESS_TELEMETRY"], "0")
+
+    def test_a_bad_hermes_subprocess_env_fails_loudly(self):
+        sys.modules["tools.environments.local"].hermes_subprocess_env = lambda: ["not", "a", "dict"]
+        with self.assertRaises(TypeError):
+            self.plugin._env(self.data / "ws")
 
 
 class Workspace(unittest.TestCase):
@@ -375,11 +559,156 @@ class Running(Base):
         self.assertEqual(result["exit_code"], 1)
         self.assertIn("iPhone in Use", result["stderr"])
 
-    def test_screenshot_paths_in_the_output_are_listed(self):
+    def test_a_screenshot_written_during_the_call_is_listed(self):
         shot = self.data / "shot.png"
-        shot.write_bytes(b"\x89PNG")
-        result = self.run_tool(f"print('saved {shot}')")
+        result = self.run_tool(self.save_code(shot))
         self.assertEqual(result["screenshots"], [str(shot)])
+        self.assertTrue(shot.is_file())
+
+    def test_an_image_path_on_stderr_is_not_attached(self):
+        calls = self.install_vision()
+        shot = self.data / "err.png"
+        code = (
+            "import sys\n"
+            "from pathlib import Path\n"
+            f"p = Path({str(shot)!r})\n"
+            "p.write_bytes(b'img')\n"
+            "sys.stderr.write(str(p) + '\\n')\n"
+            "print('done')\n"
+        )
+        raw = self.plugin.phone_exec({"code": code})
+        self.assertIsInstance(raw, str)
+        self.assertNotIn("screenshots", json.loads(raw))
+        self.assertEqual(calls, [])
+
+    def test_an_older_image_path_is_not_this_call(self):
+        shot = self.data / "old.png"
+        shot.write_bytes(b"png")
+        old = time.time() - 30
+        os.utime(shot, (old, old))
+        result = self.run_tool(f"print({str(shot)!r})")
+        self.assertNotIn("screenshots", result)
+
+    def test_only_an_absolute_image_from_this_call_counts(self):
+        missing = "/no/such/phone-harness-shot.png"
+        code = (
+            "print('shot.png')\n"
+            "print('./nested.jpg')\n"
+            f"print({missing!r})\n"
+            "print('https://cdn.example/a.png')\n"
+            "print('/tmp/notes.png.bak')\n"
+        )
+        result = self.run_tool(code)
+        self.assertNotIn("screenshots", result)
+        found = self.plugin._IMAGE_PATH.findall(
+            r"C:\shots\a.JPEG /tmp/b.webp shot.png ./c.jpg '/tmp/e.png' /tmp/a.png.bak"
+        )
+        self.assertIn(r"C:\shots\a.JPEG", found)
+        self.assertIn("/tmp/b.webp", found)
+        self.assertIn("/tmp/e.png", found)
+        self.assertNotIn("shot.png", found)
+        self.assertNotIn("./c.jpg", found)
+        self.assertFalse(any(item.endswith("c.jpg") or item.endswith(".bak") for item in found))
+
+    def test_the_last_fresh_image_is_the_one_kept(self):
+        first = self.data / "first.png"
+        second = self.data / "second.jpg"
+        stale = self.data / "stale.webp"
+        stale.write_bytes(b"old")
+        os.utime(stale, (time.time() - 30, time.time() - 30))
+        code = self.save_code(first) + self.save_code(second) + f"print({str(stale)!r})\n"
+        result = self.run_tool(code)
+        self.assertEqual(result["screenshots"], [str(second)])
+
+    def test_a_screenshot_is_attached_when_the_model_can_view_images(self):
+        cases = (
+            ("live.png", "image/png"),
+            ("live.jpg", "image/jpeg"),
+            ("live.jpeg", "image/jpeg"),
+            ("live.webp", "image/webp"),
+            ("live.PNG", "image/png"),
+        )
+        for name, mime in cases:
+            with self.subTest(name=name):
+                calls = self.install_vision(embed_bytes=1234, max_dimension=1568)
+                shot = self.data / name
+                raw = self.plugin.phone_exec({"code": self.save_code(shot)})
+                self.assertIsInstance(raw, dict)
+                self.assertTrue(raw["_multimodal"])
+                self.assertEqual(raw["meta"], {"screenshot_path": str(shot), "native_vision": True})
+                self.assertEqual(raw["content"][0]["type"], "text")
+                self.assertIn("inspect it with your native vision", raw["content"][0]["text"])
+                self.assertEqual(raw["content"][1], {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/jpeg;base64,qq"},
+                })
+                summary = json.loads(raw["text_summary"])
+                self.assertEqual(summary["screenshots"], [str(shot)])
+                self.assertTrue(summary["success"])
+                self.assertEqual(calls, [{
+                    "path": shot,
+                    "mime_type": mime,
+                    "max_base64_bytes": 1234,
+                    "max_dimension": 1568,
+                    "force_jpeg": True,
+                }])
+
+    def test_a_failed_script_still_attaches_the_screenshot_it_saved(self):
+        calls = self.install_vision()
+        shot = self.data / "then-fail.png"
+        raw = self.plugin.phone_exec({"code": self.save_code(shot) + "raise SystemExit(2)\n"})
+        self.assertIsInstance(raw, dict)
+        summary = json.loads(raw["text_summary"])
+        self.assertFalse(summary["success"])
+        self.assertEqual(summary["exit_code"], 2)
+        self.assertEqual(summary["screenshots"], [str(shot)])
+        self.assertEqual(calls[0]["path"], shot)
+
+    def test_attach_falls_back_to_text_when_the_model_cannot_view_images(self):
+        calls = self.install_vision(native=False)
+        shot = self.data / "text-only.png"
+        raw = self.plugin.phone_exec({"code": self.save_code(shot)})
+        self.assertIsInstance(raw, str)
+        payload = json.loads(raw)
+        self.assertEqual(payload["screenshots"], [str(shot)])
+        self.assertNotIn("_multimodal", payload)
+        self.assertEqual(calls, [])
+
+    def test_attach_falls_back_to_text_when_resizing_fails(self):
+        def boom(*args, **kwargs):
+            raise RuntimeError("cannot read image")
+
+        self.install_vision(resize=boom)
+        shot = self.data / "broken.png"
+        raw = self.plugin.phone_exec({"code": self.save_code(shot)})
+        self.assertIsInstance(raw, str)
+        payload = json.loads(raw)
+        self.assertEqual(payload["screenshots"], [str(shot)])
+        self.assertNotIn("data:image", raw)
+
+    def test_attach_falls_back_to_text_when_the_image_data_is_unusable(self):
+        self.install_vision(resize=lambda *args, **kwargs: "")
+        shot = self.data / "empty.png"
+        raw = self.plugin.phone_exec({"code": self.save_code(shot)})
+        self.assertIsInstance(raw, str)
+        self.assertEqual(json.loads(raw)["screenshots"], [str(shot)])
+
+    def test_attach_falls_back_to_text_when_vision_support_is_missing(self):
+        shot = self.data / "plain.png"
+        raw = self.plugin.phone_exec({"code": self.save_code(shot)})
+        self.assertIsInstance(raw, str)
+        self.assertEqual(json.loads(raw)["screenshots"], [str(shot)])
+
+    def test_a_file_modified_within_the_timestamp_slack_counts(self):
+        shot = self.data / "edge.png"
+        shot.write_bytes(b"x")
+        # Whole-second filesystems can store the mtime a second early. A file
+        # written just before the check stays inside that slack; one from
+        # several seconds ago does not.
+        self.assertEqual(self.plugin._find_screenshot(str(shot), time.time()), str(shot))
+        old = time.time() - 10
+        os.utime(shot, (old, old))
+        self.assertIsNone(self.plugin._find_screenshot(str(shot), time.time()))
 
     def test_empty_code_and_a_missing_module_are_errors_not_crashes(self):
         self.assertFalse(self.run_tool("   ")["success"])
@@ -404,3 +733,26 @@ class Running(Base):
         self.assertFalse(busy["success"])
         self.assertIn("busy", busy["error"])
         self.assertTrue(self.run_tool("print('after')")["success"])   # the lock was released
+
+
+class PluginManifest(unittest.TestCase):
+    def test_the_package_pin_is_exact_and_the_plugin_version_stays(self):
+        text = (PLUGIN_INIT.parent / "plugin.yaml").read_text(encoding="utf-8")
+        self.assertIn("\nversion: 0.1.0\n", text)
+        self.assertIn("phone-harness==0.3.1", text)
+        self.assertNotIn(">=", text)
+        self.assertIn("classifier_auto_run:", text)
+        self.assertIn("heuristic", text)
+        self.assertIn("bypass", text)
+
+    def test_the_readme_says_every_run_asks_and_describes_the_opt_in(self):
+        text = (PLUGIN_INIT.parent / "README.md").read_text(encoding="utf-8")
+        self.assertIn("Every `phone_exec` call asks", text)
+        self.assertIn("classifier_auto_run", text)
+        self.assertIn("PHONE_HARNESS_CLASSIFIER_AUTO_RUN", text)
+        self.assertIn("heuristic", text)
+        self.assertIn("bypassed", text)
+        self.assertNotIn("never ask", text)
+        self.assertIn("attached to the tool result", text)
+        self.assertIn("screenshots", text)
+        self.assertIn("`screenshot()` prints the path", text)
